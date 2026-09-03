@@ -1,5 +1,9 @@
+
+# Adapted from https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/iqn_atari_jax.py
 # Adapted from https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/c51_atari_jax.py
-# C51: Bellemare, Dabney & Munos (2017), https://arxiv.org/abs/1707.06887
+# IQN: Dabney, Ostrovski, Silver & Munos (2018), https://arxiv.org/abs/1806.06923
+
+
 import os
 import random
 import time
@@ -24,7 +28,7 @@ from jaxatari.wrappers import (
     LogWrapper,
     FlattenObservationWrapper,
 )
-from agents.c51.c51_eval import evaluate
+from agents.iqn.iqn_eval import evaluate
 from rtpt import RTPT
 
 
@@ -74,12 +78,13 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
     return thunk
 
 
-class C51CNNNetwork(nn.Module):
+class IQNCNNNetwork(nn.Module):
     action_dim: int
-    n_atoms: int
+    n_cos: int = 64
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, taus):
+        # x: (B, 4, 84, 84)   taus: (B, N)   ->  (B, N, action_dim)
         x = jnp.transpose(x, (0, 2, 3, 1))
         x = x.astype(jnp.float32)
         x = x / 255.0
@@ -89,33 +94,44 @@ class C51CNNNetwork(nn.Module):
         x = nn.relu(x)
         x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(x)
         x = nn.relu(x)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512)(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.action_dim * self.n_atoms)(x)
-        x = x.reshape((x.shape[0], self.action_dim, self.n_atoms))
-        return nn.softmax(x, axis=-1)
+        psi = x.reshape((x.shape[0], -1))
+
+        i = jnp.arange(1, self.n_cos + 1, dtype=jnp.float32)
+        cos = jnp.cos(jnp.pi * taus[..., None] * i)
+        phi = nn.relu(nn.Dense(psi.shape[-1])(cos))
+
+        h = psi[:, None, :] * phi
+        h = nn.relu(nn.Dense(512)(h))
+        return nn.Dense(self.action_dim)(h)
 
 
-class C51MLPNetwork(nn.Module):
+class IQNMLPNetwork(nn.Module):
     action_dim: int
-    n_atoms: int
+    n_cos: int = 64
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, taus):
+        # x: (B, obs_dim)   taus: (B, N)   ->  (B, N, action_dim)
         x = nn.Dense(461, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.relu(x)
         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.action_dim * self.n_atoms, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-        x = x.reshape((x.shape[0], self.action_dim, self.n_atoms))
-        return nn.softmax(x, axis=-1)
+        psi = nn.relu(x)
 
-#params + optimizer state + target_params
-class C51TrainState(TrainState):
+        i = jnp.arange(1, self.n_cos + 1, dtype=jnp.float32)
+        cos = jnp.cos(jnp.pi * taus[..., None] * i)
+        phi = nn.relu(nn.Dense(psi.shape[-1],
+                               kernel_init=orthogonal(np.sqrt(2)),
+                               bias_init=constant(0.0))(cos))
+
+        h = psi[:, None, :] * phi
+        return nn.Dense(self.action_dim,
+                        kernel_init=orthogonal(1.0),
+                        bias_init=constant(0.0))(h)
+
+
+class IQNTrainState(TrainState):
     target_params: flax.core.FrozenDict
 
-# One transition, stored in the buffer
 
 @flax.struct.dataclass
 class TimeStep:
@@ -123,7 +139,6 @@ class TimeStep:
     action: jnp.array
     reward: jnp.array
     done: jnp.array
-    
 
 
 def single_run(config: dict):
@@ -183,29 +198,40 @@ def single_run(config: dict):
     batch_size = config.get("BATCH_SIZE", 32)
     total_timesteps = config.get("TOTAL_TIMESTEPS", 10000000)
 
-    n_atoms = config.get("N_ATOMS", 51)
-    v_min = config.get("V_MIN", -10.0)
-    v_max = config.get("V_MAX", 10.0)
-    atoms = jnp.linspace(v_min, v_max, n_atoms)
-    delta_z = (v_max - v_min) / (n_atoms - 1)
+
+
+    # IQN has no fixed grid to place or to smear onto ( change the number of atoms (C51) to the resolution of the quantile distribution (IQN))
+    
+
+    n_tau = config.get("N_TAU", 64)   # taus for the online net
+
+    n_tau_prime = config.get("N_TAU_PRIME", 64)  # taus for the target net
+
+    n_tau_k = config.get("N_TAU_K", 32)   # taus used when choosing an action
+
+    n_cos = config.get("N_COS", 64)   # cosine basis size (paper default)
+
+    kappa = config.get("KAPPA", 1.0)   # huber loss threshold (paper default)   
+
 
     key, q_key = jax.random.split(key, 2)
-    network = C51CNNNetwork(action_dim=action_dim, n_atoms=n_atoms) if config.get("PIXEL_BASED", True) else C51MLPNetwork(action_dim=action_dim, n_atoms=n_atoms)
+    network = IQNCNNNetwork(action_dim=action_dim, n_cos=n_cos) if config.get("PIXEL_BASED", True) else IQNMLPNetwork(action_dim=action_dim, n_cos=n_cos)
 
     dummy_obs = jnp.zeros((1, *obs_shape))
-    q_params = network.init(q_key, dummy_obs)
+    dummy_taus = jnp.zeros((1, n_tau))
+    q_params = network.init(q_key, dummy_obs, dummy_taus)
 
-    # CleanRL C51 uses eps = 0.01 / batch_size
+    # CleanRL IQN uses eps = 0.01 / batch_size
     tx = optax.adam(learning_rate=config.get("LEARNING_RATE"), eps=0.01 / batch_size)
 
-    agent_state = C51TrainState.create(
+    agent_state = IQNTrainState.create(
         apply_fn=network.apply,
         params=q_params,
         target_params=jax.tree.map(jnp.copy, q_params),
         tx=tx,
     )
 
-    # uniform sampling: C51 has no prioritised replay
+    # uniform sampling: IQN has no prioritised replay
     replay_buffer = fbx.make_flat_buffer(
         max_length=config.get("BUFFER_SIZE", 1000000),
         min_length=config.get("LEARNING_STARTS", 80000),
@@ -229,19 +255,22 @@ def single_run(config: dict):
     )
     buffer_state = replay_buffer.init(_dummy_step)
 
-    def full_c51_step(agent_state, buffer_state, env_state, obs, rng, global_step):
+    def full_iqn_step(agent_state, buffer_state, env_state, obs, rng, global_step):
         def take_action(carry, _):
             agent_state, buffer_state, env_state, obs, global_step, rng = carry
 
-            rng, action_rng, explore_rng = jax.random.split(rng, 3)
+            rng, action_rng, explore_rng, tau_rng = jax.random.split(rng, 4)  #Change it to split off a fourth key for τ:
+
             epsilon = jnp.interp(
                 global_step,
                 jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * total_timesteps]),
                 jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)]),
             )
 
-            pmfs = agent_state.apply_fn(agent_state.params, obs)
-            q_values = (pmfs * atoms[None, None, :]).sum(-1)
+            taus = jax.random.uniform(tau_rng, (num_envs, n_tau_k))
+            quantiles = agent_state.apply_fn(agent_state.params, obs, taus)   # (num_envs, K, A)
+            q_values = quantiles.mean(axis=1)                                 # (num_envs, A)
+
             greedy_actions = q_values.argmax(axis=-1)
             random_actions = jax.random.randint(action_rng, (num_envs,), 0, action_dim)
 
@@ -269,7 +298,7 @@ def single_run(config: dict):
 
         def do_update(update_carry, _):
             u_state, u_key = update_carry
-            u_key, sample_key = jax.random.split(u_key)
+            u_key, sample_key, tau_key, tau_prime_key, tau_k_key = jax.random.split(u_key, 5)
 
             batch = replay_buffer.sample(buffer_state, sample_key).experience
             b_obs = batch.first.obs
@@ -278,39 +307,45 @@ def single_run(config: dict):
             b_don = batch.first.done
             b_nobs = batch.second.obs
 
-            # greedy next action under the target network (no double-Q in C51)
-            next_pmfs = u_state.apply_fn(u_state.target_params, b_nobs)
-            next_q = (next_pmfs * atoms[None, None, :]).sum(-1)
+
+            # greedy next action under the target network (no double-Q in IQN)
+            taus_k = jax.random.uniform(tau_k_key, (batch_size, n_tau_k))
+            next_q = u_state.apply_fn(u_state.target_params, b_nobs, taus_k).mean(axis=1)
             next_action = jnp.argmax(next_q, axis=-1)
-            next_pmfs = next_pmfs[jnp.arange(batch_size), next_action]
 
-            # categorical projection onto the fixed atom support
-            next_atoms = b_rew[:, None] + gamma * atoms[None, :] * (1.0 - b_don[:, None])
-            tz = jnp.clip(next_atoms, v_min, v_max)
-            b = (tz - v_min) / delta_z
-            l = jnp.clip(jnp.floor(b).astype(jnp.int32), 0, n_atoms - 1)
-            u = jnp.clip(jnp.ceil(b).astype(jnp.int32), 0, n_atoms - 1)
-            d_l = (u.astype(jnp.float32) + (l == u).astype(jnp.float32) - b) * next_pmfs
-            d_u = (b - l.astype(jnp.float32)) * next_pmfs
+            # target quantiles at that action
+            taus_prime = jax.random.uniform(tau_prime_key, (batch_size, n_tau_prime))
+            next_quantiles = u_state.apply_fn(u_state.target_params, b_nobs, taus_prime)
+            next_quantiles = jnp.take_along_axis(
+                next_quantiles, next_action[:, None, None], axis=-1
+            ).squeeze(-1)                                              # (B, N')
 
-            target_pmfs = jnp.zeros((batch_size, n_atoms))
+            target_quantiles = b_rew[:, None] + gamma * (1.0 - b_don[:, None]) * next_quantiles
+            target_quantiles = jax.lax.stop_gradient(target_quantiles)
 
-            def project_sample(i, val):
-                val = val.at[i, l[i]].add(d_l[i])
-                val = val.at[i, u[i]].add(d_u[i])
-                return val
-
-            target_pmfs = jax.lax.fori_loop(0, batch_size, project_sample, target_pmfs)
-            target_pmfs = jax.lax.stop_gradient(target_pmfs)
+            taus = jax.random.uniform(tau_key, (batch_size, n_tau))
 
             def q_loss_fn(params):
-                pmfs = u_state.apply_fn(params, b_obs)
-                p = pmfs[jnp.arange(batch_size), b_act.reshape(-1)]
-                p = jnp.clip(p, 1e-5, 1 - 1e-5)
-                loss = (-(target_pmfs * jnp.log(p)).sum(-1)).mean()
-                q_val = (p * atoms[None, :]).sum(-1).mean()
+                quantiles = u_state.apply_fn(params, b_obs, taus)      # (B, N, A)
+                pred = jnp.take_along_axis(
+                    quantiles, b_act.reshape(-1)[:, None, None], axis=-1
+                ).squeeze(-1)                                          # (B, N)
+
+                # pairwise TD errors: target on axis 1, prediction on axis 2
+                td = target_quantiles[:, :, None] - pred[:, None, :]   # (B, N', N)
+
+                abs_td = jnp.abs(td)
+                huber = jnp.where(abs_td <= kappa,
+                                  0.5 * td ** 2,
+                                  kappa * (abs_td - 0.5 * kappa))
+                weight = jnp.abs(taus[:, None, :] - (td < 0).astype(jnp.float32))
+
+                loss = (weight * huber / kappa).sum(axis=-1).mean(axis=-1).mean()
+                q_val = pred.mean()
                 return loss, q_val
 
+
+                
             (loss, q_val), grads = jax.value_and_grad(q_loss_fn, has_aux=True)(u_state.params)
             new_state = u_state.apply_gradients(grads=grads)
 
@@ -352,7 +387,7 @@ def single_run(config: dict):
                     flax.serialization.to_bytes(
                         [
                             config,
-                            c51_carry[0].params
+                            iqn_carry[0].params
                          ]
                     )
                 )
@@ -383,10 +418,11 @@ def single_run(config: dict):
                 ),
                 config["ENV_ID"],
                 eval_episodes=10,
-                Model=C51CNNNetwork if config["PIXEL_BASED"] else C51MLPNetwork,
-                n_atoms=n_atoms,
-                v_min=v_min,
-                v_max=v_max,
+                Model=IQNCNNNetwork if config["PIXEL_BASED"] else IQNMLPNetwork,
+
+                n_cos=n_cos,
+                n_tau_k=n_tau_k,
+
                 seed=config["SEED"] + 42,  # use a different seed for evaluation
             )
             metrics[mod_label] = np.mean(jax.device_get(episodic_returns))
@@ -409,36 +445,36 @@ def single_run(config: dict):
         return metrics
 
     # we step n_envs each iteration
-    print(f"[c51] start compile...")
+    print(f"[iqn] start compile...")
     start_compile = time.perf_counter()
     global_step = jnp.array(0, dtype=jnp.int32)
-    c51_carry = (agent_state, buffer_state, _state, _obs, key, global_step)
+    iqn_carry = (agent_state, buffer_state, _state, _obs, key, global_step)
 
     def scanned_steps(carry):
         def step_fn(c, _):
-            return full_c51_step(*c)
+            return full_iqn_step(*c)
         return jax.lax.scan(step_fn, carry, None, length=config.get("SCAN_STEPS", 1000))
 
     # donate the carry so XLA writes the new replay buffer over the old one instead of
     # allocating a second copy; lower/compile AOT so nothing is donated before the loop
-    compiled = jax.jit(scanned_steps, donate_argnums=(0,)).lower(c51_carry).compile()
+    compiled = jax.jit(scanned_steps, donate_argnums=(0,)).lower(iqn_carry).compile()
     end_compile = time.perf_counter()
-    print(f"[c51] compilation time: {end_compile - start_compile:.2f}s")
+    print(f"[iqn] compilation time: {end_compile - start_compile:.2f}s")
     steps_per_iteration = config.get("NUM_ENVS") * config.get("TRAIN_FREQUENCY") * config.get("SCAN_STEPS")
     rtpt = RTPT(name_initials=config["NAME_INITIALS"], experiment_name=run_name, max_iterations=config.get("TOTAL_TIMESTEPS") // steps_per_iteration)
     rtpt.start()
     run_time = time.perf_counter()
-    print(f"[c51] starting training for {config.get('TOTAL_TIMESTEPS')} steps...")
+    print(f"[iqn] starting training for {config.get('TOTAL_TIMESTEPS')} steps...")
     while global_step < config.get("TOTAL_TIMESTEPS"):
         rtpt.step()
         iteration = global_step // steps_per_iteration
         if config["EVAL_DURING_TRAIN"] and iteration > 0 and iteration % config["EVAL_EVERY"] == 0:
             save_and_eval(global_step)
         iteration_time_start = time.perf_counter()
-        result = compiled(c51_carry)
-        c51_carry, (infos, loss, q_val) = result
-        global_step = int(c51_carry[-1])
-        print(f"[c51] iteration {iteration} | global_step {global_step} | avg_return {infos['returned_episode_returns'][-1].mean():.2f} | avg_length {infos['returned_episode_lengths'][-1].mean():.2f} | td_loss {loss[-1]:.4f} | q_val {q_val[-1]:.4f} | SPS {int(global_step / (time.perf_counter() - run_time))} | SPS_update {int(config['NUM_ENVS'] * config['TRAIN_FREQUENCY'] * config['SCAN_STEPS'] / (time.perf_counter() - iteration_time_start))}")
+        result = compiled(iqn_carry)
+        iqn_carry, (infos, loss, q_val) = result
+        global_step = int(iqn_carry[-1])
+        print(f"[iqn] iteration {iteration} | global_step {global_step} | avg_return {infos['returned_episode_returns'][-1].mean():.2f} | avg_length {infos['returned_episode_lengths'][-1].mean():.2f} | td_loss {loss[-1]:.4f} | q_val {q_val[-1]:.4f} | SPS {int(global_step / (time.perf_counter() - run_time))} | SPS_update {int(config['NUM_ENVS'] * config['TRAIN_FREQUENCY'] * config['SCAN_STEPS'] / (time.perf_counter() - iteration_time_start))}")
         metrics = {
             "charts/avg_episodic_return": infos["returned_episode_returns"][-1].mean(),
             "charts/avg_episodic_length": infos["returned_episode_lengths"][-1].mean(),
